@@ -83,7 +83,13 @@ class MotionToMusicConfig:
     intensity_gain: float = 18.0
     intensity_ema: float = 0.85
     onset_gain: float = 2.5
+
+    # When intensity is below this, we still keep a quiet "idle" groove,
+    # but we stop the heavy stuff (kicks/fills/claps, big lead hits).
     min_intensity: float = 0.01
+
+    # Idle groove level (0..1). Keeps the system obviously "alive".
+    idle_level: float = 0.08
 
     # EDM
     bpm: float = 100.0
@@ -189,6 +195,12 @@ def parse_args() -> MotionToMusicConfig:
     p.add_argument("--intensity-ema", type=float, default=0.85)
     p.add_argument("--onset-gain", type=float, default=2.5)
     p.add_argument("--min-intensity", type=float, default=0.01)
+    p.add_argument(
+        "--idle-level",
+        type=float,
+        default=0.08,
+        help="Idle groove amplitude (0..1) when there is no motion",
+    )
 
     p.add_argument("--bpm", type=float, default=100.0)
     p.add_argument("--master-amp", type=float, default=0.9)
@@ -230,6 +242,7 @@ def parse_args() -> MotionToMusicConfig:
         intensity_ema=a.intensity_ema,
         onset_gain=a.onset_gain,
         min_intensity=a.min_intensity,
+        idle_level=a.idle_level,
         bpm=a.bpm,
         master_amp=a.master_amp,
         output_device=a.output_device,
@@ -335,16 +348,19 @@ def build_edm_mode(cfg: MotionToMusicConfig, motion_state: dict):
         dE = float(motion_state.get("dE", 0.0))
         C = float(motion_state.get("C", 0.5))
 
-        # Gate everything when basically still.
-        if E < cfg.min_intensity:
-            return
+        # When still, keep a quiet "idle" groove so the connection is
+        # obvious: motion makes it explode; stillness makes it die down.
+        active = E >= cfg.min_intensity
+        idle = float(cfg.idle_level)
 
         # --- Kick ---
+        # Keep a quiet kick on the grid when idle; go full power when active.
         is_four_on_floor = i in (0, 4, 8, 12)
         fill_prob = clip01(0.05 + 0.35 * dE)
-        do_fill = (not is_four_on_floor) and (random.random() < fill_prob)
+        do_fill = (not is_four_on_floor) and active and (random.random() < fill_prob)
         if is_four_on_floor or do_fill:
-            vel = clip01(0.45 + 0.55 * E + 0.85 * dE)
+            vel = (0.25 + 0.50 * E + 0.85 * dE) if active else (0.20 * idle)
+            vel = clip01(vel)
             kick_amp.value = vel
             kick_click_amp.value = vel * 0.6
             # quick pitch drop
@@ -355,40 +371,43 @@ def build_edm_mode(cfg: MotionToMusicConfig, motion_state: dict):
             kick_click_env.play()
 
         # --- Clap ---
-        if i in (4, 12):
-            vel = clip01(0.22 + 1.10 * dE + 0.45 * E)
+        if active and i in (4, 12):
+            vel = clip01(0.18 + 1.10 * dE + 0.45 * E)
             clap_amp.value = vel
             clap_env.play()
 
         # --- Hats (8th-note drive) ---
+        # Idle hats keep the groove alive.
         if i % 2 == 0:
-            vel = clip01(0.08 + 0.35 * E + 0.25 * dE)
-            hat_amp.value = vel
+            vel = (0.06 + 0.32 * E + 0.25 * dE) if active else (0.12 * idle)
+            hat_amp.value = clip01(vel)
             hat_env.play()
 
         # --- Bass ---
+        # Idle bass is a soft root pulse.
         if i in (0, 8):
-            vel = clip01(0.18 + 0.55 * E)
-            bass_amp.value = vel
-            # Root most of the time; sometimes fifth when motion is bottom-heavy.
+            vel = (0.16 + 0.55 * E) if active else (0.20 * idle)
+            bass_amp.value = clip01(vel)
             bass_note = 45  # A2
-            if C > 0.62 and (random.random() < clip01(0.25 + 0.35 * E)):
+            if active and C > 0.62 and (random.random() < clip01(0.25 + 0.35 * E)):
                 bass_note = 52  # E3
             bass_freq.value = midi_to_hz(bass_note)
-            bass_cut.value = 120.0 + (E * 1400.0)
+            bass_cut.value = 90.0 + ((E if active else idle) * 1600.0)
             bass_env.play()
 
         # --- Lead ---
-        # Update lead on off-beats for groove.
+        # When idle: sparse, quiet lead to keep the "dancer controls it" link.
         if i in (2, 6, 10, 14):
-            vel = clip01(0.10 + 0.45 * E + 0.55 * dE)
-            lead_amp.value = vel
-            # Top is "high" (invert centroid).
-            t = 1.0 - float(np.clip(C, 0.0, 1.0))
-            midi = quantize_scale_degree(t, degrees=degrees, root_midi=root_midi, octaves=2)
-            lead_freq.value = midi_to_hz(midi)
-            lead_cut.value = 600.0 + (E * 4500.0)
-            lead_env.play()
+            vel = (0.10 + 0.45 * E + 0.55 * dE) if active else (0.10 * idle)
+            vel = clip01(vel)
+            if active or (random.random() < 0.35):
+                lead_amp.value = vel
+                # Top is "high" (invert centroid).
+                t = 1.0 - float(np.clip(C, 0.0, 1.0))
+                midi = quantize_scale_degree(t, degrees=degrees, root_midi=root_midi, octaves=2)
+                lead_freq.value = midi_to_hz(midi)
+                lead_cut.value = 500.0 + ((E if active else idle) * 5000.0)
+                lead_env.play()
 
         if cfg.debug and i == 0:
             print(f"E={E:0.3f} dE={dE:0.3f} C={C:0.3f}")
