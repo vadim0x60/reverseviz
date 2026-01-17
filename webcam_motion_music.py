@@ -95,6 +95,13 @@ class MotionToMusicConfig:
     bpm: float = 100.0
     master_amp: float = 0.9
 
+    # "Bombastic move" detection.
+    # If either (E > hype_intensity) or (dE > hype_onset), we trigger a one-shot
+    # accent (crash / impact) and temporarily hype the lead.
+    hype_intensity: float = 0.8
+    hype_onset: float = 0.15
+    hype_cooldown_steps: int = 8
+
     # Mix levels (pre-master)
     kick_level: float = 1.0
     clap_level: float = 0.7
@@ -205,6 +212,10 @@ def parse_args() -> MotionToMusicConfig:
     p.add_argument("--bpm", type=float, default=100.0)
     p.add_argument("--master-amp", type=float, default=0.9)
 
+    p.add_argument("--hype-intensity", type=float, default=0.55)
+    p.add_argument("--hype-onset", type=float, default=0.35)
+    p.add_argument("--hype-cooldown-steps", type=int, default=8)
+
     p.add_argument("--output-device", type=int, default=None)
     p.add_argument("--list-audio-devices", action="store_true")
 
@@ -245,6 +256,9 @@ def parse_args() -> MotionToMusicConfig:
         idle_level=a.idle_level,
         bpm=a.bpm,
         master_amp=a.master_amp,
+        hype_intensity=a.hype_intensity,
+        hype_onset=a.hype_onset,
+        hype_cooldown_steps=a.hype_cooldown_steps,
         output_device=a.output_device,
         f_low=a.f_low,
         f_high=a.f_high,
@@ -296,10 +310,17 @@ def build_edm_mode(cfg: MotionToMusicConfig, motion_state: dict):
     clap_env = Adsr(attack=0.001, decay=0.12, sustain=0.0, release=0.0, dur=0.14, mul=clap_amp)
     clap = ButBP(Noise(mul=clap_env), freq=2000, q=6)
 
-    # Hats: bright noise tick.
+        # Hats: bright noise tick.
     hat_amp = Sig(0.0)
     hat_env = Adsr(attack=0.001, decay=0.05, sustain=0.0, release=0.0, dur=0.06, mul=hat_amp)
     hat = ButHP(Noise(mul=hat_env), freq=6500)
+
+    # Crash/impact: bright noise burst into reverb (triggered on big moves).
+    crash_amp = Sig(0.0)
+    crash_env = Adsr(attack=0.001, decay=0.9, sustain=0.0, release=0.0, dur=0.95, mul=crash_amp)
+    crash_src = ButHP(Noise(mul=crash_env), freq=2500)
+    crash = Freeverb(crash_src, size=0.93, damp=0.5, bal=0.55)
+
 
     # Bass: sine + a touch of harmonics, lowpassed.
     bass_amp = Sig(0.0)
@@ -323,8 +344,9 @@ def build_edm_mode(cfg: MotionToMusicConfig, motion_state: dict):
 
     # Mix
     drums = (kick + kick_click) * cfg.kick_level + clap * cfg.clap_level + hat * cfg.hat_level
+    fx = crash * 0.9
     melodic = bass * cfg.bass_level + (lead_sat + lead_rev) * cfg.lead_level
-    pre = Mix(drums + melodic, voices=2)
+    pre = Mix(drums + melodic + fx, voices=2)
 
     master = Compress(pre, thresh=-18, ratio=5, risetime=0.01, falltime=0.12)
     out = master.out()
@@ -339,6 +361,7 @@ def build_edm_mode(cfg: MotionToMusicConfig, motion_state: dict):
     root_midi = 57  # A3
 
     step = {"i": -1}
+    hype = {"cooldown": 0}
 
     def on_step():
         step["i"] = (step["i"] + 1) % 16
@@ -352,6 +375,17 @@ def build_edm_mode(cfg: MotionToMusicConfig, motion_state: dict):
         # obvious: motion makes it explode; stillness makes it die down.
         active = E >= cfg.min_intensity
         idle = float(cfg.idle_level)
+
+        # --- Hype detection ---
+        if hype["cooldown"] > 0:
+            hype["cooldown"] -= 1
+
+        is_hype = (E >= float(cfg.hype_intensity)) or (dE >= float(cfg.hype_onset))
+        if active and is_hype and hype["cooldown"] == 0:
+            # Big gesture => obvious impact.
+            crash_amp.value = clip01(0.35 + 0.95 * dE + 0.55 * E)
+            crash_env.play()
+            hype["cooldown"] = int(cfg.hype_cooldown_steps)
 
         # --- Kick ---
         # Keep a quiet kick on the grid when idle; go full power when active.
@@ -400,13 +434,25 @@ def build_edm_mode(cfg: MotionToMusicConfig, motion_state: dict):
         if i in (2, 6, 10, 14):
             vel = (0.10 + 0.45 * E + 0.55 * dE) if active else (0.10 * idle)
             vel = clip01(vel)
+
+            # In hype moments, make it *obviously* pop:
+            # - higher velocity
+            # - octave jump when dancer is "up" (centroid near top)
+            # - brighter filter
+            hype_boost = 1.0
+            octave_boost = 0
+            if active and is_hype:
+                hype_boost = 1.0 + 0.9 * clip01(max(E - cfg.hype_intensity, dE - cfg.hype_onset) + 0.35)
+                if C < 0.45:
+                    octave_boost = 12
+
             if active or (random.random() < 0.35):
-                lead_amp.value = vel
+                lead_amp.value = clip01(vel * hype_boost)
                 # Top is "high" (invert centroid).
                 t = 1.0 - float(np.clip(C, 0.0, 1.0))
-                midi = quantize_scale_degree(t, degrees=degrees, root_midi=root_midi, octaves=2)
+                midi = quantize_scale_degree(t, degrees=degrees, root_midi=root_midi, octaves=2) + octave_boost
                 lead_freq.value = midi_to_hz(midi)
-                lead_cut.value = 500.0 + ((E if active else idle) * 5000.0)
+                lead_cut.value = 500.0 + ((E if active else idle) * 5000.0) + (1500.0 if (active and is_hype) else 0.0)
                 lead_env.play()
 
         if cfg.debug and i == 0:
@@ -430,6 +476,8 @@ def build_edm_mode(cfg: MotionToMusicConfig, motion_state: dict):
         "clap_env": clap_env,
         "hat": hat,
         "hat_env": hat_env,
+        "crash": crash,
+        "crash_env": crash_env,
         "bass": bass,
         "bass_env": bass_env,
         "bass_freq": bass_freq,
