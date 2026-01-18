@@ -50,6 +50,14 @@ Show a debug video window (press `q` to quit):
 python3 reverseviz.py --show
 ```
 
+**Live Tuning (DJ Mode):**
+
+Open an interactive window with sliders to tweak motion sensitivity, mix levels, and synth parameters in real-time:
+
+```bash
+python3 reverseviz.py --dj
+```
+
 List audio output devices and pick one:
 
 ```bash
@@ -62,6 +70,8 @@ python3 reverseviz.py --output-device 3
 ### `edm` (default)
 
 A fixed-tempo 16-step sequencer with a stable scale (A minor pentatonic). Motion controls groove intensity, accents, note choice, and timbre.
+
+- **Spectral Filter Bank**: In this mode, your vertical pose (the motion vector) directly shapes the timbre of the lead synth via a 48-band filter bank. Raising your hands or moving in specific vertical zones carves out different frequencies.
 
 Useful options:
 
@@ -89,7 +99,7 @@ python3 reverseviz.py --mode pitch
 
 ## Tuning the motion detector
 
-If it feels too sensitive or too dead, these usually matter most:
+If it feels too sensitive or too dead, these usually matter most (all can be tuned live using `--dj`):
 
 - `--diff-threshold` (ignore tiny pixel changes)
 - `--blur` (smooth noise; must be odd internally)
