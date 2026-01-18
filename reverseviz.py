@@ -423,17 +423,35 @@ def build_edm_mode(cfg: MotionToMusicConfig, motion_state: dict[str, float], liv
     bass_cut = SigTo(value=120.0, time=0.05, init=120.0)
     bass = ButLP(bass_src, freq=bass_cut)
 
-    # Lead: saw oscillator, filtered, delayed + reverb.
+    # Lead: Spectral Filter Bank
     lead_amp = Sig(0.0)
     lead_env = Adsr(attack=0.003, decay=0.12, sustain=0.0, release=0.0, dur=0.16, mul=lead_amp)
-    lead_freq = SigTo(value=440.0, time=0.03, init=440.0)
+    lead_freq = SigTo(value=220.0, time=0.03, init=220.0)
     lead_table = SawTable(order=12)
-    lead_osc = Osc(table=lead_table, freq=lead_freq, mul=lead_env)
-    lead_cut = SigTo(value=800.0, time=0.06, init=800.0)
-    lead_filt = ButLP(lead_osc, freq=lead_cut)
-    lead_sat = Disto(lead_filt, drive=0.75, slope=0.85, mul=1.0)
-    lead_del = Delay(lead_sat, delay=0.30, feedback=0.25, mul=0.55)  # ~8th note at 100 BPM
-    lead_rev = Freeverb(lead_sat + lead_del, size=0.82, damp=0.6, bal=0.22)
+
+    # Carrier: Multiple oscillators for a richer sound to be filtered
+    lead_carrier_src = Osc(table=lead_table, freq=[lead_freq, lead_freq * 1.005, lead_freq * 0.5], mul=lead_env)
+    lead_carrier = Mix(lead_carrier_src, voices=1)
+
+    num_bands = 48
+    # Logarithmic frequencies from 60Hz to 10kHz, reversed so top (vec[0]) is high freq
+    band_freqs = [log_interp(60, 10000, i / (num_bands - 1)) for i in range(num_bands)]
+    band_freqs.reverse()
+    band_sigs = [SigTo(0.0, time=0.05) for _ in range(num_bands)]
+
+    # Filter bank: ButBP returns a multi-channel object
+    filters = ButBP(lead_carrier, freq=band_freqs, q=20)
+    
+    # Use a single multi-channel SigTo for all bands to be more efficient and avoid ArithmeticError
+    band_sigs = SigTo([0.0] * num_bands, time=0.05)
+    
+    # Modulate each band. Multi-channel multiplication: 48 chans * 48 chans
+    modulated_filters = filters * band_sigs
+    lead_spectral = Mix(modulated_filters, voices=1)
+
+    lead_sat = Disto(lead_spectral, drive=0.8, slope=0.9, mul=2.5)
+    lead_del = Delay(lead_sat, delay=0.30, feedback=0.35, mul=0.6)
+    lead_rev = Freeverb(lead_sat + lead_del, size=0.85, damp=0.5, bal=0.3)
 
     # Mix (levels are SigTo so the GUI can adjust smoothly)
     kick_level = SigTo(value=cfg.kick_level, time=0.10, init=cfg.kick_level)
@@ -614,7 +632,6 @@ def build_edm_mode(cfg: MotionToMusicConfig, motion_state: dict[str, float], liv
                 t = 1.0 - float(np.clip(C, 0.0, 1.0))
                 midi = quantize_scale_degree(t, degrees=degrees, root_midi=root_midi, octaves=2) + octave_boost
                 lead_freq.value = midi_to_hz(midi)
-                lead_cut.value = 500.0 + ((E if active else idle) * 5000.0) + (1500.0 if (active and is_hype) else 0.0)
                 lead_env.play()
 
         if cfg.debug and i == 0:
@@ -648,6 +665,10 @@ def build_edm_mode(cfg: MotionToMusicConfig, motion_state: dict[str, float], liv
         "lead_freq": lead_freq,
         "lead_del": lead_del,
         "lead_rev": lead_rev,
+        "filters": filters,
+        "modulated_filters": modulated_filters,
+        "lead_spectral": lead_spectral,
+        "band_sigs": band_sigs,
         "kick_level": kick_level,
         "clap_level": clap_level,
         "hat_level": hat_level,
@@ -686,7 +707,7 @@ def main() -> None:
     s.start()
 
     # Shared motion state (used by the EDM sequencer callback).
-    motion_state: dict[str, float] = {"E": 0.0, "dE": 0.0, "C": 0.5}
+    motion_state: dict[str, any] = {"E": 0.0, "dE": 0.0, "C": 0.5, "V": np.zeros(cfg.bins)}
 
     # Build audio graph.
     pitch_freq = None
@@ -713,6 +734,7 @@ def main() -> None:
     print(f"Running mode={cfg.mode}. Press Ctrl+C to stop.")
     if cfg.mode == "edm":
         print(f"EDM clock: {cfg.bpm:.1f} BPM (8th hats, stable A minor).")
+        print("Spectral Filter Bank enabled: your vertical pose shapes the lead synth.")
     if cfg.dj:
         print("DJ UI enabled: tweak sliders in the 'DJ' window.")
     if cfg.show:
@@ -779,6 +801,21 @@ def main() -> None:
             motion_state["C"] = C
             motion_state["E"] = E
             motion_state["dE"] = dE
+            motion_state["V"] = smoothed_vec
+
+            # Update Spectral Filter Bank if present
+            if "band_sigs" in audio_objs:
+                band_sigs = audio_objs["band_sigs"]
+                # Apply gain to all bands at once using multi-channel list expansion
+                num_bands = cfg.bins
+                if len(smoothed_vec) == num_bands:
+                    v_resampled = smoothed_vec
+                else:
+                    x_in = np.linspace(0, 1, len(smoothed_vec))
+                    x_out = np.linspace(0, 1, num_bands)
+                    v_resampled = np.interp(x_out, x_in, smoothed_vec)
+                
+                band_sigs.value = (v_resampled * intensity_gain * 2.5).tolist()
 
             if cfg.mode == "pitch" and pitch_freq is not None and pitch_amp is not None:
                 apply_live = audio_objs.get("apply_live")
