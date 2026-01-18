@@ -96,6 +96,7 @@ class MotionToMusicConfig:
     # UI
     show: bool = False
     debug: bool = False
+    dj: bool = False
 
 
 def _ensure_odd(n: int) -> int:
@@ -202,6 +203,7 @@ def parse_args() -> MotionToMusicConfig:
 
     p.add_argument("--show", action="store_true")
     p.add_argument("--debug", action="store_true")
+    p.add_argument("--dj", action="store_true", help="Open a live DJ control GUI (OpenCV sliders)")
 
     a = p.parse_args()
 
@@ -241,32 +243,148 @@ def parse_args() -> MotionToMusicConfig:
         pitch_glide_sec=a.pitch_glide,
         show=a.show,
         debug=a.debug,
+        dj=a.dj,
     )
 
 
-def build_pitch_mode(cfg: MotionToMusicConfig):
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return float(max(lo, min(hi, float(v))))
+
+
+def _dj_create_controls(cfg: MotionToMusicConfig) -> tuple[list[tuple[str, str, callable]], np.ndarray]:
+    """Create an OpenCV trackbar window for live tuning.
+
+    Returns (controls, canvas) where controls is a list of (key, label, getter)
+    and canvas is a dummy image to keep the window interactive.
+    """
+
+    win = "DJ"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win, 460, 900)
+
+    # Some OpenCV builds only let you interact with trackbars if the window is
+    # being refreshed with imshow().
+    canvas = np.zeros((120, 460, 3), dtype=np.uint8)
+    cv2.imshow(win, canvas)
+    cv2.waitKey(1)
+
+    controls: list[tuple[str, str, callable]] = []
+
+    def add_float01(key: str, label: str, init01: float) -> None:
+        init = int(round(_clamp(init01, 0.0, 1.0) * 100.0))
+        cv2.createTrackbar(label, win, init, 100, lambda _: None)
+
+        def getter() -> float:
+            return float(cv2.getTrackbarPos(label, win)) / 100.0
+
+        controls.append((key, label, getter))
+
+    def add_float(key: str, label: str, init: float, lo: float, hi: float, steps: int = 100) -> None:
+        init01 = 0.0 if hi == lo else (float(init) - float(lo)) / (float(hi) - float(lo))
+        init_pos = int(round(_clamp(init01, 0.0, 1.0) * float(steps)))
+        cv2.createTrackbar(label, win, init_pos, int(steps), lambda _: None)
+
+        def getter() -> float:
+            pos = float(cv2.getTrackbarPos(label, win))
+            t = pos / float(steps)
+            return float(lo + (hi - lo) * t)
+
+        controls.append((key, label, getter))
+
+    def add_int(key: str, label: str, init: int, lo: int, hi: int) -> None:
+        init_pos = int(_clamp(init, lo, hi) - lo)
+        cv2.createTrackbar(label, win, init_pos, int(hi - lo), lambda _: None)
+
+        def getter() -> float:
+            return float(lo + cv2.getTrackbarPos(label, win))
+
+        controls.append((key, label, getter))
+
+    # Motion
+    add_int("bins", "motion:bns", cfg.bins, 8, 128)
+    add_int("blur", "motion:blr", cfg.blur, 1, 31)
+    add_int("diff_threshold", "motion:thr", cfg.diff_threshold, 0, 64)
+    add_float("vec_ema", "motion:vecE", cfg.vec_ema, 0.0, 0.99, steps=99)
+
+    add_float("intensity_gain", "map:gain", cfg.intensity_gain, 0.0, 40.0, steps=200)
+    add_float("intensity_ema", "map:intE", cfg.intensity_ema, 0.0, 0.99, steps=99)
+    add_float("onset_gain", "map:onst", cfg.onset_gain, 0.0, 6.0, steps=120)
+    add_float("min_intensity", "gate:min", cfg.min_intensity, 0.0, 0.25, steps=100)
+    add_float("idle_level", "gate:idle", cfg.idle_level, 0.0, 0.30, steps=100)
+
+    # Master / clock
+    add_float("master_amp", "mix:amp", cfg.master_amp, 0.0, 1.0, steps=100)
+    add_float("bpm", "clk:bpm", cfg.bpm, 60.0, 180.0, steps=240)
+
+    # Hype
+    add_float01("hype_intensity", "hype:E", cfg.hype_intensity)
+    add_float01("hype_onset", "hype:dE", cfg.hype_onset)
+    add_int("hype_cooldown_steps", "hype:cd", cfg.hype_cooldown_steps, 0, 32)
+
+    # Mix levels
+    add_float("kick_level", "lvl:kck", cfg.kick_level, 0.0, 2.0, steps=200)
+    add_float("clap_level", "lvl:clp", cfg.clap_level, 0.0, 2.0, steps=200)
+    add_float("hat_level", "lvl:hat", cfg.hat_level, 0.0, 2.0, steps=200)
+    add_float("bass_level", "lvl:bas", cfg.bass_level, 0.0, 2.0, steps=200)
+    add_float("lead_level", "lvl:led", cfg.lead_level, 0.0, 2.0, steps=200)
+
+    # Pitch mode extras
+    add_float("f_low", "ptch:lo", cfg.f_low, 20.0, 400.0, steps=380)
+    add_float("f_high", "ptch:hi", cfg.f_high, 200.0, 4000.0, steps=380)
+    add_float01("pitch_amp", "ptch:amp", cfg.pitch_amp)
+    add_float("pitch_glide_sec", "ptch:gl", cfg.pitch_glide_sec, 0.0, 0.25, steps=250)
+
+    return controls, canvas
+
+
+def _dj_poll(controls: list[tuple[str, str, callable]], live: dict[str, float]) -> None:
+    for key, _label, getter in controls:
+        try:
+            live[key] = float(getter())
+        except Exception:
+            continue
+
+
+def build_pitch_mode(cfg: MotionToMusicConfig, live: dict[str, float]):
     freq_sig = SigTo(value=cfg.f_low, time=cfg.pitch_glide_sec, init=cfg.f_low)
     amp_sig = SigTo(value=0.0, time=cfg.pitch_glide_sec, init=0.0)
-    osc = Sine(freq=freq_sig, mul=amp_sig * cfg.pitch_amp)
+
+    pitch_level = SigTo(value=cfg.pitch_amp, time=0.10, init=cfg.pitch_amp)
+    osc = Sine(freq=freq_sig, mul=amp_sig * pitch_level)
     comp = Compress(osc, thresh=-20, ratio=6, risetime=0.01, falltime=0.1)
     out = comp.out()
+
+    def apply_live() -> None:
+        amp = live.get("pitch_amp")
+        if amp is not None:
+            pitch_level.value = float(amp)
+
+        glide = live.get("pitch_glide_sec")
+        if glide is not None:
+            g = max(0.0, float(glide))
+            freq_sig.time = g
+            amp_sig.time = g
 
     # Keep references to avoid GC-induced crashes in some pyo builds.
     keep = {
         "freq_sig": freq_sig,
         "amp_sig": amp_sig,
+        "pitch_level": pitch_level,
         "osc": osc,
         "comp": comp,
         "out": out,
+        "apply_live": apply_live,
     }
     return freq_sig, amp_sig, keep
 
 
-def build_edm_mode(cfg: MotionToMusicConfig, motion_state: dict):
+def build_edm_mode(cfg: MotionToMusicConfig, motion_state: dict[str, float], live: dict[str, float]):
     """Create instruments and a step callback.
 
     motion_state is a dict updated by the video loop:
       E (0..1), dE (0..1), C (0..1 top..bottom)
+
+    live is a dict of parameter overrides updated by the DJ UI.
     """
 
     # --- Instruments ---
@@ -317,19 +435,79 @@ def build_edm_mode(cfg: MotionToMusicConfig, motion_state: dict):
     lead_del = Delay(lead_sat, delay=0.30, feedback=0.25, mul=0.55)  # ~8th note at 100 BPM
     lead_rev = Freeverb(lead_sat + lead_del, size=0.82, damp=0.6, bal=0.22)
 
-    # Mix
-    drums = (kick + kick_click) * cfg.kick_level + clap * cfg.clap_level + hat * cfg.hat_level
+    # Mix (levels are SigTo so the GUI can adjust smoothly)
+    kick_level = SigTo(value=cfg.kick_level, time=0.10, init=cfg.kick_level)
+    clap_level = SigTo(value=cfg.clap_level, time=0.10, init=cfg.clap_level)
+    hat_level = SigTo(value=cfg.hat_level, time=0.10, init=cfg.hat_level)
+    bass_level = SigTo(value=cfg.bass_level, time=0.10, init=cfg.bass_level)
+    lead_level = SigTo(value=cfg.lead_level, time=0.10, init=cfg.lead_level)
+
+    drums = (kick + kick_click) * kick_level + clap * clap_level + hat * hat_level
     fx = crash * 0.9
-    melodic = bass * cfg.bass_level + (lead_sat + lead_rev) * cfg.lead_level
+    melodic = bass * bass_level + (lead_sat + lead_rev) * lead_level
     pre = Mix(drums + melodic + fx, voices=2)
 
     master = Compress(pre, thresh=-18, ratio=5, risetime=0.01, falltime=0.12)
     out = master.out()
 
+    def apply_live() -> None:
+        # Motion parameters
+        if "bins" in live:
+            cfg.bins = int(live["bins"])
+        if "blur" in live:
+            cfg.blur = int(live["blur"])
+        if "diff_threshold" in live:
+            cfg.diff_threshold = int(live["diff_threshold"])
+        if "vec_ema" in live:
+            cfg.vec_ema = float(live["vec_ema"])
+
+        if "intensity_gain" in live:
+            cfg.intensity_gain = float(live["intensity_gain"])
+        if "intensity_ema" in live:
+            cfg.intensity_ema = float(live["intensity_ema"])
+        if "onset_gain" in live:
+            cfg.onset_gain = float(live["onset_gain"])
+        if "min_intensity" in live:
+            cfg.min_intensity = float(live["min_intensity"])
+        if "idle_level" in live:
+            cfg.idle_level = float(live["idle_level"])
+
+        # EDM / mix
+        if "bpm" in live:
+            cfg.bpm = float(live["bpm"])
+        if "master_amp" in live:
+            cfg.master_amp = float(live["master_amp"])
+
+        if "hype_intensity" in live:
+            cfg.hype_intensity = float(live["hype_intensity"])
+        if "hype_onset" in live:
+            cfg.hype_onset = float(live["hype_onset"])
+        if "hype_cooldown_steps" in live:
+            cfg.hype_cooldown_steps = int(live["hype_cooldown_steps"])
+
+        if "kick_level" in live:
+            kick_level.value = float(live["kick_level"])
+        if "clap_level" in live:
+            clap_level.value = float(live["clap_level"])
+        if "hat_level" in live:
+            hat_level.value = float(live["hat_level"])
+        if "bass_level" in live:
+            bass_level.value = float(live["bass_level"])
+        if "lead_level" in live:
+            lead_level.value = float(live["lead_level"])
+
+        # Push amp into the running server.
+        try:
+            out.getServer().setAmp(float(cfg.master_amp))
+        except Exception:
+            pass
+
     # --- Sequencer ---
     bpm = float(cfg.bpm)
     step_time = 60.0 / bpm / 4.0  # 16th notes
     metro = Metro(time=step_time).play()
+
+    last_bpm = {"v": float(cfg.bpm)}
 
     # A minor pentatonic (degrees relative to A): A C D E G
     degrees = [0, 3, 5, 7, 10]
@@ -339,6 +517,15 @@ def build_edm_mode(cfg: MotionToMusicConfig, motion_state: dict):
     hype = {"cooldown": 0}
 
     def on_step():
+        # Pull live parameters on the audio thread.
+        apply_live()
+
+        # Adjust clock live if BPM changes.
+        bpm_now = float(cfg.bpm)
+        if abs(bpm_now - float(last_bpm["v"])) > 1e-6:
+            metro.time = 60.0 / max(1e-6, bpm_now) / 4.0
+            last_bpm["v"] = bpm_now
+
         step["i"] = (step["i"] + 1) % 16
         i = step["i"]
 
@@ -461,6 +648,12 @@ def build_edm_mode(cfg: MotionToMusicConfig, motion_state: dict):
         "lead_freq": lead_freq,
         "lead_del": lead_del,
         "lead_rev": lead_rev,
+        "kick_level": kick_level,
+        "clap_level": clap_level,
+        "hat_level": hat_level,
+        "bass_level": bass_level,
+        "lead_level": lead_level,
+        "apply_live": apply_live,
         "metro": metro,
         "trig": trig,
         "step_time": step_time,
@@ -469,6 +662,9 @@ def build_edm_mode(cfg: MotionToMusicConfig, motion_state: dict):
 
 def main() -> None:
     cfg = parse_args()
+
+    # Shared live-tunable parameters (updated by the DJ UI).
+    live: dict[str, float] = {}
 
     cap = cv2.VideoCapture(cfg.camera)
     if not cap.isOpened():
@@ -495,14 +691,20 @@ def main() -> None:
     # Build audio graph.
     pitch_freq = None
     pitch_amp = None
-    audio_objs = {}
+    audio_objs: dict[str, object] = {}
     if cfg.mode == "pitch":
-        pitch_freq, pitch_amp, audio_objs = build_pitch_mode(cfg)
+        pitch_freq, pitch_amp, audio_objs = build_pitch_mode(cfg, live)
     else:
-        audio_objs = build_edm_mode(cfg, motion_state)
+        audio_objs = build_edm_mode(cfg, motion_state, live)
 
     prev_gray: np.ndarray | None = None
     smoothed_vec: np.ndarray | None = None
+
+    dj_controls: list[tuple[str, str, callable]] | None = None
+    dj_canvas: np.ndarray | None = None
+    if cfg.dj:
+        dj_controls, dj_canvas = _dj_create_controls(cfg)
+        _dj_poll(dj_controls, live)
 
     E_ema = 0.0
 
@@ -511,6 +713,8 @@ def main() -> None:
     print(f"Running mode={cfg.mode}. Press Ctrl+C to stop.")
     if cfg.mode == "edm":
         print(f"EDM clock: {cfg.bpm:.1f} BPM (8th hats, stable A minor).")
+    if cfg.dj:
+        print("DJ UI enabled: tweak sliders in the 'DJ' window.")
     if cfg.show:
         print("Showing video window. Press 'q' to quit.")
 
@@ -521,6 +725,20 @@ def main() -> None:
             if not ok:
                 time.sleep(0.01)
                 continue
+
+            if dj_controls is not None and dj_canvas is not None:
+                # Refresh the DJ window to keep sliders interactive.
+                cv2.imshow("DJ", dj_canvas)
+                cv2.waitKey(1)
+                _dj_poll(dj_controls, live)
+
+            # Apply any live motion-processing tweaks.
+            if "blur" in live:
+                cfg.blur = int(live["blur"])
+            if "diff_threshold" in live:
+                cfg.diff_threshold = int(live["diff_threshold"])
+
+            blur_k = _ensure_odd(max(1, int(cfg.blur)))
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             if blur_k > 1:
@@ -540,29 +758,41 @@ def main() -> None:
             row_energy = diff.sum(axis=1).astype(np.float32)
             row_energy /= float(diff.shape[1] * 255)
 
-            vec = bin_rows(row_energy, cfg.bins)
+            bins = int(live.get("bins", cfg.bins))
+            vec = bin_rows(row_energy, bins)
 
-            if smoothed_vec is None:
+            vec_ema = float(live.get("vec_ema", cfg.vec_ema))
+            if smoothed_vec is None or smoothed_vec.shape != vec.shape:
                 smoothed_vec = vec
             else:
-                smoothed_vec = (float(cfg.vec_ema) * smoothed_vec) + ((1.0 - float(cfg.vec_ema)) * vec)
+                smoothed_vec = (vec_ema * smoothed_vec) + ((1.0 - vec_ema) * vec)
 
             C = weighted_centroid(smoothed_vec)  # 0..1 top..bottom
-            E = intensity_from_vec(smoothed_vec, cfg.intensity_gain)
+            intensity_gain = float(live.get("intensity_gain", cfg.intensity_gain))
+            E = intensity_from_vec(smoothed_vec, intensity_gain)
 
-            E_ema = (float(cfg.intensity_ema) * E_ema) + ((1.0 - float(cfg.intensity_ema)) * E)
-            dE = clip01((E - E_ema) * float(cfg.onset_gain))
+            intensity_ema = float(live.get("intensity_ema", cfg.intensity_ema))
+            onset_gain = float(live.get("onset_gain", cfg.onset_gain))
+            E_ema = (intensity_ema * E_ema) + ((1.0 - intensity_ema) * E)
+            dE = clip01((E - E_ema) * onset_gain)
 
             motion_state["C"] = C
             motion_state["E"] = E
             motion_state["dE"] = dE
 
             if cfg.mode == "pitch" and pitch_freq is not None and pitch_amp is not None:
+                apply_live = audio_objs.get("apply_live")
+                if callable(apply_live):
+                    apply_live()
+
                 # Map centroid to pitch (top=high).
                 t = 1.0 - float(np.clip(C, 0.0, 1.0))
-                freq = log_interp(cfg.f_low, cfg.f_high, t)
+                f_low = float(live.get("f_low", cfg.f_low))
+                f_high = float(live.get("f_high", cfg.f_high))
+                freq = log_interp(f_low, f_high, t)
                 amp = E
-                if amp < cfg.min_intensity:
+                min_intensity = float(live.get("min_intensity", cfg.min_intensity))
+                if amp < min_intensity:
                     amp = 0.0
                 pitch_freq.value = freq
                 pitch_amp.value = amp
@@ -585,6 +815,10 @@ def main() -> None:
                 cv2.imshow("motion", vis)
                 if (cv2.waitKey(1) & 0xFF) == ord("q"):
                     break
+            elif dj_controls is not None and dj_canvas is not None:
+                # Keep OpenCV processing events for the slider window.
+                cv2.imshow("DJ", dj_canvas)
+                cv2.waitKey(1)
 
             dt = time.time() - t0
             if dt < target_period:
